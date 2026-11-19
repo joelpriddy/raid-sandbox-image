@@ -1,0 +1,11 @@
+# Proposes reviewed bumps of the pinned base-image digest and of the SHA-pinned actions (free for public repositories).
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

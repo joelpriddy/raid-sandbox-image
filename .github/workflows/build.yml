@@ -1,7 +1,12 @@
 # Build, scan, push and sign the RAID tier-3 sandbox image (RAID harness plan 3.6, R4).
-# Pull requests build and scan only. main (and the weekly run, which picks up base-image fixes) also pushes to GHCR and
-# signs the pushed digest keyless with cosign (Sigstore; the signer is this workflow on main). RAID pins a digest only
-# after `cosign verify` with this workflow's identity, and after a review. Actions are pinned by commit SHA.
+# - scan: every event. Builds the image and scans it with Trivy, with read-only rights (pull-request code never holds
+#   package or signing rights).
+# - publish: main, the weekly run and manual runs only, after scan. Pushes by commit tag, scans that exact pushed
+#   digest, signs it keyless with cosign (Sigstore; the signer is this workflow on main), then moves :latest last.
+#   Runs on main are never cancelled midway, so a pushed digest is always signed.
+# The base image is pinned by digest; Dependabot proposes digest bumps (.github/dependabot.yml). The weekly run rescans
+# so a newly published CVE fails visibly. RAID pins a digest only after `cosign verify` with this workflow's identity,
+# a review and its tier-3 acceptance. Actions are pinned by commit SHA.
 name: build-sign
 
 on:
@@ -17,18 +22,14 @@ permissions:
 
 concurrency:
   group: build-sign-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  image:
+  scan:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 15
     permissions:
       contents: read
-      packages: write
-      id-token: write
-    env:
-      IMAGE: ghcr.io/${{ github.repository_owner }}/raid-sandbox
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,16 +54,32 @@ jobs:
           ignore-unfixed: true
           exit-code: "1"
 
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository_owner }}/raid-sandbox
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
       - name: Log in to GHCR
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push
-        if: github.event_name != 'pull_request'
+      - name: Push by commit tag
         id: push
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -71,20 +88,25 @@ jobs:
           push: true
           provenance: mode=max
           sbom: true
-          tags: |
-            ${{ env.IMAGE }}:latest
-            ${{ env.IMAGE }}:${{ github.sha }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Scan the pushed digest
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}@${{ steps.push.outputs.digest }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Install cosign
-        if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
-      - name: Sign the pushed digest (keyless)
-        if: github.event_name != 'pull_request'
+      - name: Sign the pushed digest (keyless), then move latest
         env:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           cosign sign --yes "${IMAGE}@${DIGEST}"
+          docker buildx imagetools create --tag "${IMAGE}:latest" "${IMAGE}@${DIGEST}"
           {
             echo "### Signed image"
             echo ""
